@@ -20,7 +20,7 @@ class ParametricEQBand {
     private var targetCoeffs: BiquadCoefficients
     private var x1: Double = 0, x2: Double = 0
     private var y1: Double = 0, y2: Double = 0
-    private let smoothing: Double = 0.05
+    private let smoothing: Double = 0.05 // Prevents zipper noise
 
     init(type: EQFilterType, frequency: Double, sampleRate: Double, gainDB: Double, q: Double) {
         self.type = type
@@ -39,79 +39,85 @@ class ParametricEQBand {
         targetCoeffs = Self.design(type: type, freq: frequency, fs: sampleRate, gainDB: gainDB, q: q)
     }
 
+    func process(buffer: UnsafeMutablePointer<Float>, frames: Int) {
+        // Smooth coefficient transitions to prevent clicks
+        coeffs.b0 += (targetCoeffs.b0 - coeffs.b0) * smoothing
+        coeffs.b1 += (targetCoeffs.b1 - coeffs.b1) * smoothing
+        coeffs.b2 += (targetCoeffs.b2 - coeffs.b2) * smoothing
+        coeffs.a1 += (targetCoeffs.a1 - coeffs.a1) * smoothing
+        coeffs.a2 += (targetCoeffs.a2 - coeffs.a2) * smoothing
+
+        let b0 = Float(coeffs.b0), b1 = Float(coeffs.b1), b2 = Float(coeffs.b2)
+        let a1 = Float(coeffs.a1), a2 = Float(coeffs.a2)
+        var lx1 = Float(x1), lx2 = Float(x2)
+        var ly1 = Float(y1), ly2 = Float(y2)
+
+        for i in 0..<frames {
+            let x = buffer[i]
+            let y = b0 * x + b1 * lx1 + b2 * lx2 - a1 * ly1 - a2 * ly2
+            buffer[i] = y
+            lx2 = lx1; lx1 = x
+            ly2 = ly1; ly1 = y
+        }
+
+        x1 = Double(lx1); x2 = Double(lx2)
+        y1 = Double(ly1); y2 = Double(ly2)
+    }
+
+    // Audio Cookbook Biquad Math
     static func design(type: EQFilterType, freq: Double, fs: Double, gainDB: Double, q: Double) -> BiquadCoefficients {
-        let A = pow(10, gainDB / 40)
-        let w0 = 2 * .pi * freq / fs
-        let alpha = sin(w0) / (2 * q)
-        let cosw0 = cos(w0)
+        let w0 = 2.0 * .pi * freq / fs
+        let alpha = sin(w0) / (2.0 * q)
+        let A = pow(10.0, gainDB / 40.0)
         
         var b0, b1, b2, a0, a1, a2: Double
         
         switch type {
         case .peaking:
-            b0 = 1 + alpha * A
-            b1 = -2 * cosw0
-            b2 = 1 - alpha * A
-            a0 = 1 + alpha / A
-            a1 = -2 * cosw0
-            a2 = 1 - alpha / A
+            b0 = 1.0 + alpha * A
+            b1 = -2.0 * cos(w0)
+            b2 = 1.0 - alpha * A
+            a0 = 1.0 + alpha / A
+            a1 = -2.0 * cos(w0)
+            a2 = 1.0 - alpha / A
         case .lowShelf:
-            let sqA = 2 * sqrt(A) * alpha
-            b0 = A * ((A + 1) - (A - 1) * cosw0 + sqA)
-            b1 = 2 * A * ((A - 1) - (A + 1) * cosw0)
-            b2 = A * ((A + 1) - (A - 1) * cosw0 - sqA)
-            a0 = (A + 1) + (A - 1) * cosw0 + sqA
-            a1 = -2 * ((A - 1) + (A + 1) * cosw0)
-            a2 = (A + 1) + (A - 1) * cosw0 - sqA
+            b0 = A * ((A + 1.0) - (A - 1.0) * cos(w0) + 2.0 * sqrt(A) * alpha)
+            b1 = 2.0 * A * ((A - 1.0) - (A + 1.0) * cos(w0))
+            b2 = A * ((A + 1.0) - (A - 1.0) * cos(w0) - 2.0 * sqrt(A) * alpha)
+            a0 = (A + 1.0) + (A - 1.0) * cos(w0) + 2.0 * sqrt(A) * alpha
+            a1 = -2.0 * ((A - 1.0) + (A + 1.0) * cos(w0))
+            a2 = (A + 1.0) + (A - 1.0) * cos(w0) - 2.0 * sqrt(A) * alpha
         case .highShelf:
-            let sqA = 2 * sqrt(A) * alpha
-            b0 = A * ((A + 1) + (A - 1) * cosw0 + sqA)
-            b1 = -2 * A * ((A - 1) + (A + 1) * cosw0)
-            b2 = A * ((A + 1) + (A - 1) * cosw0 - sqA)
-            a0 = (A + 1) - (A - 1) * cosw0 + sqA
-            a1 = 2 * ((A - 1) - (A + 1) * cosw0)
-            a2 = (A + 1) - (A - 1) * cosw0 - sqA
-        default:
-            return BiquadCoefficients(b0: 1, b1: 0, b2: 0, a1: 0, a2: 0)
+            b0 = A * ((A + 1.0) + (A - 1.0) * cos(w0) + 2.0 * sqrt(A) * alpha)
+            b1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * cos(w0))
+            b2 = A * ((A + 1.0) + (A - 1.0) * cos(w0) - 2.0 * sqrt(A) * alpha)
+            a0 = (A + 1.0) - (A - 1.0) * cos(w0) + 2.0 * sqrt(A) * alpha
+            a1 = 2.0 * ((A - 1.0) - (A + 1.0) * cos(w0))
+            a2 = (A + 1.0) - (A - 1.0) * cos(w0) - 2.0 * sqrt(A) * alpha
+        default: // Fallback to peaking
+            return design(type: .peaking, freq: freq, fs: fs, gainDB: gainDB, q: q)
         }
         
         return BiquadCoefficients(b0: b0/a0, b1: b1/a0, b2: b2/a0, a1: a1/a0, a2: a2/a0)
     }
-
-    func process(_ input: UnsafeMutablePointer<Float>, frames: Int) {
-        for i in 0..<frames {
-            // Apply smoothing
-            coeffs.b0 += smoothing * (targetCoeffs.b0 - coeffs.b0)
-            coeffs.b1 += smoothing * (targetCoeffs.b1 - coeffs.b1)
-            coeffs.b2 += smoothing * (targetCoeffs.b2 - coeffs.b2)
-            coeffs.a1 += smoothing * (targetCoeffs.a1 - coeffs.a1)
-            coeffs.a2 += smoothing * (targetCoeffs.a2 - coeffs.a2)
-            
-            let x0 = Double(input[i])
-            let y0 = coeffs.b0 * x0 + coeffs.b1 * x1 + coeffs.b2 * x2 - coeffs.a1 * y1 - coeffs.a2 * y2
-            
-            x2 = x1; x1 = x0
-            y2 = y1; y1 = y0
-            
-            input[i] = Float(y0)
-        }
-    }
 }
 
 class EQEngine {
-    var bypassed = false
+    private(set) var bypassed = false
     private var sampleRate: Double = 44100
     private let maxChannels = 2
     
-    var bandFreqs: [Double] = [60, 250, 1000, 4000, 12000]
-    var bandGains: [Double] = [0, 0, 0, 0, 0]
-    var bandQs: [Double] = [0.7, 1.0, 1.0, 1.0, 0.7]
-    var bandTypes: [EQFilterType] = [.lowShelf, .peaking, .peaking, .peaking, .highShelf]
+    // PREAMP STATE
+    public var preampGainDB: Double = 0.0
+    private var currentLinearGain: Float = 1.0
+
+    // PRESET STATE
+    var bandFreqs: [Double] = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
+    var bandGains: [Double] = Array(repeating: 0.0, count: 10)
+    var bandQs: [Double] = Array(repeating: 0.707, count: 10)
+    var bandTypes: [EQFilterType] = [.lowShelf, .peaking, .peaking, .peaking, .peaking, .peaking, .peaking, .peaking, .peaking, .highShelf]
     
-    var bandCount: Int {
-        return bandFreqs.count
-    }
-    
+    var bandCount: Int { return bandFreqs.count }
     private var bandsPerChannel: [[ParametricEQBand]] = []
 
     init() { allocateBands() }
@@ -144,11 +150,38 @@ class EQEngine {
             )
         }
     }
+    
+    func loadPreset(preamp: Double, frequencies: [Double], gains: [Double], qs: [Double]) {
+        self.preampGainDB = preamp
+        for i in 0..<bandCount {
+            if i < frequencies.count {
+                updateBand(index: i, frequency: frequencies[i], gainDB: gains[i], q: qs[i])
+            }
+        }
+    }
 
+    // Argument label matching what line 450 in FLACPlayer.swift expects (frames:)
     func process(channel: Int, buffer: UnsafeMutablePointer<Float>, frames: Int) {
-        guard !bypassed, channel < maxChannels else { return }
-        for band in bandsPerChannel[channel] {
-            band.process(buffer, frames: frames)
+        guard !bypassed else { return }
+
+        // 1. GLOBAL PREAMP DSP (With Accelerate Ramping)
+        let targetGain = Float(pow(10.0, preampGainDB / 20.0))
+        let diff = targetGain - currentLinearGain
+        
+        if abs(diff) > 0.0001 {
+            var step: Float = diff / Float(frames)
+            var startGain = currentLinearGain
+            vDSP_vrampmul(buffer, 1, &startGain, &step, buffer, 1, vDSP_Length(frames))
+            currentLinearGain = targetGain
+        } else if targetGain != 1.0 {
+            var staticGain = targetGain
+            vDSP_vsmul(buffer, 1, &staticGain, buffer, 1, vDSP_Length(frames))
+        }
+
+        // 2. BIQUAD PROCESSING
+        let bands = bandsPerChannel[channel]
+        for band in bands {
+            band.process(buffer: buffer, frames: frames)
         }
     }
 }

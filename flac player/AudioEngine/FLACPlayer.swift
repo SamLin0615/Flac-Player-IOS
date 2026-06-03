@@ -372,6 +372,23 @@ class FLACPlayer: ObservableObject {
 
     var eqBandsCount: Int { eqEngine.bandCount }
 
+    var preampGainDB: Double {
+        return eqEngine.preampGainDB
+    }
+
+    func setPreampGain(_ gain: Double) {
+        // Note: Due to threading, changes are safe as EQEngine handles ramping
+        eqEngine.preampGainDB = gain
+    }
+
+    func updateEQBand(index: Int, frequency: Double, gainDB: Double, q: Double) {
+        eqEngine.updateBand(index: index, frequency: frequency, gainDB: gainDB, q: q)
+    }
+
+    func loadEQPreset(preamp: Double, frequencies: [Double], gains: [Double], qs: [Double]) {
+        eqEngine.loadPreset(preamp: preamp, frequencies: frequencies, gains: gains, qs: qs)
+    }
+
     // MARK: - Audio Unit setup
 
     private func setupAudioUnit(sampleRate: Double, channels: UInt32) {
