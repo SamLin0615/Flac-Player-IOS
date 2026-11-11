@@ -1,22 +1,19 @@
 import SwiftUI
 
 struct LyricsView: View {
-    let song: Song?
+    @Environment(\.dismiss) private var dismiss
+    let song: Song
 
     var body: some View {
-        NavigationView {
+        NavigationStack {
             ScrollView {
-                if let lyrics = song?.lyrics, !lyrics.isEmpty {
-                    Text(lyrics)
-                        .padding()
-                        .font(.body)
-                        .multilineTextAlignment(.center)
-                } else {
-                    Text("No lyrics available.")
-                        .foregroundColor(.secondary)
-                }
+                Text(song.lyrics ?? "No lyrics available.")
+                    .font(.title3).lineSpacing(8).frame(maxWidth: .infinity, alignment: .leading).padding(24)
+                    .textSelection(.enabled)
             }
             .navigationTitle("Lyrics")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
         }
     }
 }

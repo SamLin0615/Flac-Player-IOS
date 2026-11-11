@@ -1,32 +1,31 @@
+import Foundation
 import AVFAudio
 
 struct AmplitudeEngine {
-    static func compute(for url: URL) -> [Float] {
-        guard let file = try? AVAudioFile(forReading: url) else { return [] }
-        let format = file.processingFormat
-        let frameCount = UInt32(file.length)
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return [] }
-        try? file.read(into: buffer)
-        guard let channelData = buffer.floatChannelData else { return [] }
-
-        let sampleRate = format.sampleRate
-        let samplesPerChunk = Int(sampleRate) // 1 second per bar
-        var amplitudes: [Float] = []
-        var offset = 0
-        while offset < Int(frameCount) {
-            let remaining = min(samplesPerChunk, Int(frameCount) - offset)
-            var sum: Float = 0
-            for i in 0..<remaining {
-                let sample = channelData[0][offset + i]
-                sum += sample * sample
+    static func compute(for url: URL, bins: Int = 120) -> [Float] {
+        guard bins > 0,
+              let file = try? AVAudioFile(forReading: url, commonFormat: .pcmFormatFloat32, interleaved: false),
+              file.length > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 65_536) else { return [] }
+        var peaks = [Float](repeating: 0, count: bins)
+        let total = file.length
+        var position: AVAudioFramePosition = 0
+        do {
+            while position < total {
+                try file.read(into: buffer, frameCount: AVAudioFrameCount(min(65_536, total - position)))
+                let count = Int(buffer.frameLength)
+                guard count > 0, let channels = buffer.floatChannelData else { return [] }
+                for frame in 0..<count {
+                    let bin = min(bins - 1, Int(Double(position + Int64(frame)) / Double(total) * Double(bins)))
+                    for channel in 0..<Int(buffer.format.channelCount) {
+                        let value = abs(channels[channel][frame])
+                        if value.isFinite { peaks[bin] = max(peaks[bin], value) }
+                    }
+                }
+                position += Int64(count)
             }
-            let rms = sqrt(sum / Float(remaining))
-            amplitudes.append(rms)
-            offset += samplesPerChunk
-        }
-        if let maxAmp = amplitudes.max(), maxAmp > 0 {
-            amplitudes = amplitudes.map { $0 / maxAmp }
-        }
-        return amplitudes
+        } catch { return [] }
+        if let maximum = peaks.max(), maximum > 0 { return peaks.map { min(1, $0 / maximum) } }
+        return peaks
     }
 }

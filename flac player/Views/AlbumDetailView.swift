@@ -1,57 +1,26 @@
 import SwiftUI
 
 struct AlbumDetailView: View {
-    let album: String
-    @ObservedObject var library: MusicLibrary
-    @ObservedObject var player: FLACPlayer
+    @EnvironmentObject private var library: MusicLibrary
+    @EnvironmentObject private var player: FLACPlayer
+    let album: Album
 
-    private var songs: [Song] {
-        library.songs.filter { $0.album == album }
-            .sorted { ($0.discNumber ?? 0, $0.trackNumber ?? 0) < ($1.discNumber ?? 0, $1.trackNumber ?? 0) }
-    }
+    private var currentAlbum: Album { library.albums.first { $0.id == album.id } ?? album }
+    private var songs: [Song] { currentAlbum.songs }
 
     var body: some View {
         List {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(alignment: .top, spacing: 20) {
-                    if let firstSong = songs.first, let art = firstSong.artwork {
-                        Image(uiImage: art).resizable().scaledToFill()
-                            .frame(width: 130, height: 130).cornerRadius(12).shadow(radius: 5).clipped()
-                    } else {
-                        Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 130, height: 130).cornerRadius(12)
-                    }
-                    
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(album).font(.title2.bold()).lineLimit(3)
-                        Text(songs.first?.artist ?? "Unknown").font(.title3).foregroundColor(.secondary).lineLimit(2)
-                        
-                        HStack(spacing: 20) {
-                            Button(action: { player.playQueue(songs: songs) }) {
-                                Image(systemName: "play.circle.fill").resizable().frame(width: 44, height: 44).foregroundColor(.accentColor)
-                            }.buttonStyle(.plain)
-                            
-                            Button(action: { player.playQueue(songs: songs.shuffled()) }) {
-                                Image(systemName: "shuffle.circle").resizable().frame(width: 44, height: 44).foregroundColor(.secondary)
-                            }.buttonStyle(.plain)
-                        }
-                        .padding(.top, 8)
-                    }
-                    Spacer()
-                }
-                .padding(.vertical, 24)
+            VStack(spacing: 12) {
+                ArtworkView(artwork: currentAlbum.artwork, size: 220)
+                Text(currentAlbum.title).font(.title2.bold()).multilineTextAlignment(.center)
+                Text(currentAlbum.artist).foregroundStyle(.secondary)
+                if let year = currentAlbum.year { Text(String(year)).font(.caption).foregroundStyle(.secondary) }
+                CollectionPlaybackHeader(songs: songs)
+            }.frame(maxWidth: .infinity).listRowSeparator(.hidden).collectionActions(songs)
+            ForEach(Array(songs.enumerated()), id: \.offset) { index, song in
+                Button { player.play(songs: songs, startAt: index) } label: { SongRow(song: song, showTrackNumber: true) }
+                    .buttonStyle(.plain).songActions(song)
             }
-            .listRowSeparator(.hidden)
-            .listRowBackground(Color.clear)
-
-            ForEach(songs) { song in
-                Button(action: { player.playQueue(songs: songs, startIndex: songs.firstIndex(of: song) ?? 0) }) {
-                    SongRow(song: song)
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .listStyle(.plain)
-        .navigationTitle("")
-        .navigationBarTitleDisplayMode(.inline)
+        }.listStyle(.plain).navigationTitle(currentAlbum.title).navigationBarTitleDisplayMode(.inline)
     }
 }
