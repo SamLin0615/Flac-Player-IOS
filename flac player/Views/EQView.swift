@@ -1,351 +1,213 @@
 import SwiftUI
 
 struct EQView: View {
-    @ObservedObject var player: FLACPlayer
-    
-    @State private var activeBandIndex: Int = 0
-    @State private var bypass = false
-    
-    // UI State for the active nodes to prevent constant CoreAudio polling during drag
-    @State private var localFreqs: [Double] = []
-    @State private var localGains: [Double] = []
-    @State private var localQs: [Double] = []
+    @EnvironmentObject private var player: FLACPlayer
+    @EnvironmentObject private var presets: EQPresetManager
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedBand = 0
+    @State private var savingPreset = false
+    @State private var renamingPreset = false
+    @State private var presetName = ""
+    @State private var presetToRename: EQPreset?
+
+    private var currentPreset: EQPreset? { presets.presets.first { $0.id == player.currentEQPresetID } }
 
     var body: some View {
-        VStack(spacing: 0) {
-            // MARK: - Header
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Parametric EQ")
-                        .font(.title2.bold())
-                        .foregroundColor(.primary)
-                    Text(bypass ? "Bypassed" : "True Phase Response Active")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                Spacer()
-                
-                Button(action: resetEQ) {
-                    Image(systemName: "arrow.counterclockwise.circle.fill")
-                        .font(.title)
-                        .foregroundColor(.secondary)
-                }
-                .padding(.trailing, 8)
-                
-                Toggle("", isOn: $bypass)
-                    .labelsHidden()
-                    .onChange(of: bypass) { _, new in player.setEQBypass(new) }
-            }
-            .padding()
-
-            // MARK: - Audiophile Graph Visualization
-            GeometryReader { geo in
-                ZStack {
-                    // 1. Logarithmic Background Grid
-                    LogarithmicGrid(width: geo.size.width, height: geo.size.height)
-                    
-                    if !bypass && localFreqs.count > 0 {
-                        // 2. Area Under the Curve (Filled Energy Envelope)
-                        TrueResponseShape(freqs: localFreqs, gains: localGains, qs: localQs, width: geo.size.width, height: geo.size.height, fill: true)
-                            .fill(LinearGradient(
-                                colors: [Color.accentColor.opacity(0.4), Color.accentColor.opacity(0.0)],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            ))
-                        
-                        // 3. Crisp Acoustic Curve Line
-                        TrueResponseShape(freqs: localFreqs, gains: localGains, qs: localQs, width: geo.size.width, height: geo.size.height, fill: false)
-                            .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
-                        
-                        // 4. Isolated Active Crosshair
-                        let activeX = EQMath.mapFreqToX(localFreqs[activeBandIndex], width: geo.size.width)
-                        let activeY = EQMath.mapGainToY(localGains[activeBandIndex], height: geo.size.height)
-                        
-                        // Targeting Reticle
-                        Path { p in
-                            p.move(to: CGPoint(x: activeX, y: 0))
-                            p.addLine(to: CGPoint(x: activeX, y: geo.size.height))
-                            p.move(to: CGPoint(x: 0, y: activeY))
-                            p.addLine(to: CGPoint(x: geo.size.width, y: activeY))
-                        }
-                        .stroke(Color.white.opacity(0.3), style: StrokeStyle(lineWidth: 1, dash: [4]))
-                        
-                        // Draggable Handle
-                        Circle()
-                            .fill(Color.white)
-                            .frame(width: 20, height: 20)
-                            .shadow(color: .black.opacity(0.5), radius: 4)
-                            .position(x: activeX, y: activeY)
-                            .gesture(
-                                DragGesture()
-                                    .onChanged { value in
-                                        var newFreq = EQMath.mapXToFreq(value.location.x, width: geo.size.width)
-                                        var newGain = EQMath.mapYToGain(value.location.y, height: geo.size.height)
-                                        
-                                        // Hard clamp to physical limits
-                                        newFreq = max(20.0, min(20000.0, newFreq))
-                                        newGain = max(-12.0, min(12.0, newGain))
-                                        
-                                        localFreqs[activeBandIndex] = newFreq
-                                        localGains[activeBandIndex] = newGain
-                                        commitToEngine()
-                                    }
-                            )
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    presetControls
+                    Toggle("Equalizer On (A/B)", isOn: Binding(get: { !player.isEQBypassed }, set: { player.setEQBypass(!$0) }))
+                    Text(player.isEQBypassed ? "Off — preamp and filters bypassed" : "On — preamp and filters active")
+                        .font(.caption).foregroundStyle(.secondary)
+                    EQResponseGraph(selectedBand: $selectedBand).frame(height: 240)
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack { Text("Preamp"); Spacer(); Text(String(format: "%+.1f dB", player.preampGainDB)).monospacedDigit() }
+                        Slider(value: Binding(get: { player.preampGainDB }, set: { player.setPreampGain($0) }), in: -12...6, step: 0.5)
+                            .accessibilityLabel("Equalizer preamp")
+                        Toggle("Auto Headroom", isOn: Binding(get: { player.autoPreamp }, set: { player.setAutoPreamp($0) }))
+                        Text(String(format: "Effective preamp: %+.1f dB", player.effectivePreampDB)).font(.caption).foregroundStyle(.secondary)
                     }
-                }
-                .background(Color(.systemBackground).opacity(0.5))
-                .cornerRadius(12)
-                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.gray.opacity(0.2), lineWidth: 1))
-            }
-            .frame(height: 240)
-            .padding(.horizontal)
-
-            // MARK: - Sennheiser-Style Horizontal Control Carousel
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Band Controllers")
-                    .font(.caption.bold())
-                    .foregroundColor(.secondary)
-                    .padding(.horizontal)
-                    .padding(.top, 16)
-                
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 16) {
-                        ForEach(0..<localFreqs.count, id: \.self) { i in
-                            BandCardView(
-                                index: i,
-                                isActive: i == activeBandIndex,
-                                freq: $localFreqs[i],
-                                gain: $localGains[i],
-                                q: $localQs[i],
-                                onSelect: { activeBandIndex = i },
-                                onChange: { commitToEngine() }
-                            )
+                    Text("Bands").font(.headline)
+                    ScrollView(.horizontal) {
+                        HStack(spacing: 12) {
+                            ForEach(0..<player.eqBandsCount, id: \.self) { index in
+                                EQBandCard(index: index, selected: selectedBand == index) { selectedBand = index }
+                                    .frame(width: 210)
+                            }
+                        }.padding(.vertical, 4)
+                    }.scrollIndicators(.hidden)
+                    Divider()
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("ReplayGain").font(.headline)
+                        Picker("ReplayGain Mode", selection: $player.replayGainMode) {
+                            ForEach(ReplayGainMode.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) }
+                        }.pickerStyle(.segmented)
+                        HStack {
+                            Text("ReplayGain Preamp"); Spacer()
+                            Text(String(format: "%+.1f dB", player.replayGainPreampDB)).monospacedDigit()
                         }
+                        Slider(value: $player.replayGainPreampDB, in: -12...6, step: 0.5).accessibilityLabel("ReplayGain preamp")
+                        Text("Tagged tracks only. Peak tags limit gain to prevent clipping.").font(.caption).foregroundStyle(.secondary)
                     }
-                    .padding(.horizontal)
+                }.padding()
+            }
+            .navigationTitle("Equalizer").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Reset") { if let flat = presets.builtInPresets.first { player.apply(preset: flat) } }
                 }
             }
-            .padding(.bottom, 24)
+            .alert("Save as Preset", isPresented: $savingPreset) {
+                TextField("Preset name", text: $presetName)
+                Button("Save") {
+                    let preset = presets.savePreset(name: presetName.trimmingCharacters(in: .whitespacesAndNewlines), from: player)
+                    player.apply(preset: preset)
+                }.disabled(presetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("Cancel", role: .cancel) {}
+            }
+            .alert("Rename Preset", isPresented: $renamingPreset) {
+                TextField("Preset name", text: $presetName)
+                Button("Rename") {
+                    if let preset = presetToRename { presets.renamePreset(preset, name: presetName.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                }.disabled(presetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("Cancel", role: .cancel) {}
+            }
         }
-        .onAppear(perform: syncFromEngine)
     }
 
-    // MARK: - State Synchronization
-    private func syncFromEngine() {
-        self.localFreqs = player.eqFrequencies.isEmpty ? [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000] : player.eqFrequencies
-        self.localGains = player.eqGains.isEmpty ? Array(repeating: 0.0, count: 10) : player.eqGains
-        self.localQs = player.eqQs.isEmpty ? Array(repeating: 0.707, count: 10) : player.eqQs
-        self.bypass = player.isEQBypassed
-    }
-    
-    private func commitToEngine() {
-        // FIX: Changed from updateBand to updateEQBand to match FLACPlayer's signature
-        player.updateEQBand(
-            index: activeBandIndex,
-            frequency: localFreqs[activeBandIndex],
-            gainDB: localGains[activeBandIndex],
-            q: localQs[activeBandIndex]
-        )
-    }
-    
-    private func resetEQ() {
-        for i in 0..<localGains.count {
-            localGains[i] = 0.0
-            localQs[i] = 0.707
-            // FIX: Changed from updateBand to updateEQBand to match FLACPlayer's signature
-            player.updateEQBand(index: i, frequency: localFreqs[i], gainDB: 0.0, q: 0.707)
+    private var presetControls: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Menu {
+                Section("Built-in Presets") {
+                    ForEach(presets.builtInPresets) { preset in Button(preset.name) { player.apply(preset: preset) } }
+                }
+                if !presets.userPresets.isEmpty {
+                    Section("Your Presets") {
+                        ForEach(presets.userPresets) { preset in
+                            Menu(preset.name) {
+                                Button("Apply") { player.apply(preset: preset) }
+                                Button("Update from Current Settings") {
+                                    presets.updatePreset(preset, from: player)
+                                    if let updated = presets.userPresets.first(where: { $0.id == preset.id }) { player.apply(preset: updated) }
+                                }
+                                Button("Rename") { presetToRename = preset; presetName = preset.name; renamingPreset = true }
+                                Button("Delete", role: .destructive) { presets.deletePreset(preset) }
+                            }
+                        }
+                    }
+                }
+            } label: {
+                HStack {
+                    Text(currentPreset?.name ?? "Custom").font(.headline)
+                    Spacer()
+                    Image(systemName: "chevron.up.chevron.down")
+                }.frame(minHeight: 44)
+            }
+            Button("Save as Preset…", systemImage: "plus") { presetName = ""; savingPreset = true }.frame(minHeight: 44)
         }
     }
 }
 
-// MARK: - Sennheiser-Style Band Card
-struct BandCardView: View {
+private struct EQBandCard: View {
+    @EnvironmentObject private var player: FLACPlayer
     let index: Int
-    let isActive: Bool
-    @Binding var freq: Double
-    @Binding var gain: Double
-    @Binding var q: Double
-    let onSelect: () -> Void
-    let onChange: () -> Void
-    
+    let selected: Bool
+    let select: () -> Void
+
     var body: some View {
-        VStack(spacing: 12) {
-            HStack {
-                Circle().fill(isActive ? Color.accentColor : Color.gray)
-                    .frame(width: 8, height: 8)
-                Text("Band \(index + 1)")
-                    .font(.subheadline.bold())
-                    .foregroundColor(isActive ? .primary : .secondary)
-                Spacer()
-            }
-            
-            Divider()
-            
-            // Gain Control
-            VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 10) {
+            Button(action: select) {
                 HStack {
-                    Text("Gain").font(.caption2).foregroundColor(.secondary)
+                    Text("Band \(index + 1)").bold()
                     Spacer()
-                    Text(String(format: "%+.1f dB", gain)).font(.caption2.monospacedDigit())
-                }
-                Slider(value: $gain, in: -12...12, step: 0.5) { _ in onChange() }
-                    .tint(gain == 0 ? .gray : .accentColor)
-            }
-            
-            // Freq Control
-            VStack(alignment: .leading, spacing: 2) {
-                HStack {
-                    Text("Freq").font(.caption2).foregroundColor(.secondary)
-                    Spacer()
-                    Text("\(Int(freq)) Hz").font(.caption2.monospacedDigit())
-                }
-                // Logarithmic slider approximation for frequencies
-                Slider(value: Binding(
-                    get: { log10(freq) },
-                    set: { freq = pow(10, $0) }
-                ), in: log10(20)...log10(20000)) { _ in onChange() }
-            }
-            
-            // Spread (Q) Control
-            VStack(alignment: .leading, spacing: 2) {
-                HStack {
-                    Text("Q (Spread)").font(.caption2).foregroundColor(.secondary)
-                    Spacer()
-                    Text(String(format: "%.2f", q)).font(.caption2.monospacedDigit())
-                }
-                Slider(value: $q, in: 0.1...10.0, step: 0.1) { _ in onChange() }
-            }
+                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                }.frame(minHeight: 44)
+            }.buttonStyle(.plain).accessibilityLabel("Select band \(index + 1)")
+            Text(String(format: "Gain  %+.1f dB", player.eqGains[index])).font(.caption.monospacedDigit())
+            Slider(value: Binding(get: { player.eqGains[index] }, set: { player.setEQBand(index: index, gainDB: $0) }), in: -12...12, step: 0.5)
+                .accessibilityLabel("Band \(index + 1) gain")
+            Text(String(format: "Frequency  %.0f Hz", player.eqFrequencies[index])).font(.caption.monospacedDigit())
+            Slider(value: Binding(get: { log10(player.eqFrequencies[index]) }, set: { player.setEQBand(index: index, frequency: pow(10, $0)) }), in: log10(20)...log10(20000))
+                .accessibilityLabel("Band \(index + 1) frequency")
+            Text(String(format: "Q  %.2f", player.eqQs[index])).font(.caption.monospacedDigit())
+            Slider(value: Binding(get: { player.eqQs[index] }, set: { player.setEQBand(index: index, q: $0) }), in: 0.1...10, step: 0.05)
+                .accessibilityLabel("Band \(index + 1) Q")
         }
         .padding()
-        .frame(width: 200)
-        .background(Color(.secondarySystemBackground))
-        .cornerRadius(16)
-        .overlay(
-            RoundedRectangle(cornerRadius: 16)
-                .stroke(isActive ? Color.accentColor : Color.clear, lineWidth: 2)
-        )
-        .opacity(isActive ? 1.0 : 0.6)
-        .onTapGesture(perform: onSelect)
-        .animation(.easeInOut(duration: 0.2), value: isActive)
+        .background(selected ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(selected ? Color.accentColor : Color.clear, lineWidth: 2))
     }
 }
 
-// MARK: - Mathematical True Response Shape
-struct TrueResponseShape: Shape {
-    var freqs: [Double]
-    var gains: [Double]
-    var qs: [Double]
-    var width: CGFloat
-    var height: CGFloat
-    var fill: Bool
-    
-    // Tell SwiftUI to re-draw when these arrays change during drag
-    var animatableData: CGFloat { 0 }
+private struct EQResponseGraph: View {
+    @EnvironmentObject private var player: FLACPlayer
+    @Binding var selectedBand: Int
 
-    func path(in rect: CGRect) -> Path {
-        var path = Path()
-        guard freqs.count > 0 else { return path }
-        
-        let steps = 120 // Resolution of the curve
-        var points: [CGPoint] = []
-        
-        for i in 0...steps {
-            let x = CGFloat(i) / CGFloat(steps) * width
-            let targetFreq = EQMath.mapXToFreq(x, width: width)
-            
-            // Sum the true magnitude response of all active filters
-            var totalGainDB = 0.0
-            for b in 0..<freqs.count {
-                if gains[b] != 0 {
-                    totalGainDB += EQMath.filterMagnitude(freq: targetFreq, f0: freqs[b], gain: gains[b], q: qs[b])
-                }
-            }
-            
-            let y = EQMath.mapGainToY(totalGainDB, height: height)
-            points.append(CGPoint(x: x, y: y))
+    private var coefficients: [BiquadCoefficients] {
+        (0..<player.eqBandsCount).map { index in
+            EQEngine.coefficients(type: player.eqBandTypes[index], frequency: player.eqFrequencies[index],
+                                  sampleRate: player.eqSampleRate, gainDB: player.eqGains[index], q: player.eqQs[index])
         }
-        
-        if let first = points.first {
-            path.move(to: first)
-            for pt in points.dropFirst() { path.addLine(to: pt) }
-        }
-        
-        if fill {
-            let baseline = EQMath.mapGainToY(0, height: height)
-            path.addLine(to: CGPoint(x: width, y: baseline))
-            path.addLine(to: CGPoint(x: 0, y: baseline))
-            path.closeSubpath()
-        }
-        
-        return path
     }
-}
 
-// MARK: - Math & DSP UI Helpers
-struct EQMath {
-    static func mapXToFreq(_ x: CGFloat, width: CGFloat) -> Double {
-        let pct = Double(max(0, min(width, x)) / width)
-        return pow(10, log10(20.0) + pct * (log10(20000.0) - log10(20.0)))
-    }
-    static func mapFreqToX(_ freq: Double, width: CGFloat) -> CGFloat {
-        let pct = (log10(max(20, min(20000, freq))) - log10(20.0)) / (log10(20000.0) - log10(20.0))
-        return CGFloat(pct) * width
-    }
-    static func mapYToGain(_ y: CGFloat, height: CGFloat) -> Double {
-        let pct = Double(max(0, min(height, y)) / height)
-        return 12.0 - (pct * 24.0)
-    }
-    static func mapGainToY(_ gain: Double, height: CGFloat) -> CGFloat {
-        let pct = (12.0 - max(-12.0, min(12.0, gain))) / 24.0
-        return CGFloat(pct) * height
-    }
-    
-    /// Highly accurate mathematical representation of an analog Peaking EQ magnitude response
-    static func filterMagnitude(freq: Double, f0: Double, gain: Double, q: Double) -> Double {
-        let w_w0 = freq / f0
-        let w0_w = f0 / freq
-        let difference = w_w0 - w0_w
-        let denominator = 1.0 + (pow(difference, 2) * pow(q, 2))
-        return gain / denominator
-    }
-}
-
-// MARK: - Standardized Logarithmic Grid
-struct LogarithmicGrid: View {
-    let width: CGFloat
-    let height: CGFloat
-    let xLines: [Double] = [20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000]
-    let yLines: [Double] = [-12, -6, 0, 6, 12]
-    
     var body: some View {
-        ZStack {
-            // Y-Axis (Gain)
-            ForEach(yLines, id: \.self) { db in
-                let y = EQMath.mapGainToY(db, height: height)
-                Path { p in
-                    p.move(to: CGPoint(x: 0, y: y))
-                    p.addLine(to: CGPoint(x: width, y: y))
+        let filters = coefficients
+        GeometryReader { geometry in
+            ZStack {
+                Path { path in
+                    for gain in [-12.0, -6, 0, 6, 12] {
+                        let y = mapGain(gain, height: geometry.size.height)
+                        path.move(to: CGPoint(x: 0, y: y)); path.addLine(to: CGPoint(x: geometry.size.width, y: y))
+                    }
+                    for frequency in [100.0, 1000, 10000] {
+                        let x = mapFrequency(frequency, width: geometry.size.width)
+                        path.move(to: CGPoint(x: x, y: 0)); path.addLine(to: CGPoint(x: x, y: geometry.size.height))
+                    }
+                }.stroke(Color.secondary.opacity(0.2), style: StrokeStyle(lineWidth: 1, dash: [3]))
+                Path { path in
+                    for index in 0...200 {
+                        let x = geometry.size.width * CGFloat(index) / 200
+                        let frequency = frequencyAt(x, width: geometry.size.width)
+                        let gain = player.isEQBypassed ? 0 : EQEngine.magnitudeResponseDB(at: frequency, sampleRate: player.eqSampleRate, coefficients: filters)
+                        let point = CGPoint(x: x, y: mapGain(gain, height: geometry.size.height))
+                        if index == 0 { path.move(to: point) } else { path.addLine(to: point) }
+                    }
+                }.stroke(Color.accentColor, style: StrokeStyle(lineWidth: 2.5, lineJoin: .round))
+                ForEach(0..<player.eqBandsCount, id: \.self) { index in
+                    Button { selectedBand = index } label: {
+                        Circle().fill(selectedBand == index ? Color.accentColor : Color.secondary)
+                            .frame(width: selectedBand == index ? 18 : 12, height: selectedBand == index ? 18 : 12)
+                            .frame(width: 44, height: 44).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Select equalizer band \(index + 1)")
+                    .accessibilityValue(String(format: "%.0f Hz, %+.1f dB", player.eqFrequencies[index], player.eqGains[index]))
+                    .simultaneousGesture(DragGesture(minimumDistance: 4, coordinateSpace: .named("eqGraph")).onChanged { value in
+                        guard selectedBand == index else { return }
+                        let gain = min(12, max(-12, 12 - Double(value.location.y / max(1, geometry.size.height)) * 24))
+                        player.setEQBand(index: index, frequency: frequencyAt(value.location.x, width: geometry.size.width), gainDB: gain)
+                    })
+                    .position(x: mapFrequency(player.eqFrequencies[index], width: geometry.size.width), y: mapGain(player.eqGains[index], height: geometry.size.height))
                 }
-                .stroke(db == 0 ? Color.primary.opacity(0.4) : Color.primary.opacity(0.1), lineWidth: db == 0 ? 1.5 : 1)
-                
-                Text("\(Int(db)) dB")
-                    .font(.system(size: 9, weight: .bold)).foregroundColor(db == 0 ? .primary : .secondary)
-                    .position(x: 20, y: y - 8)
+                VStack { HStack { Text("+12 dB"); Spacer(); Text("20 Hz – 20 kHz") }; Spacer(); HStack { Text("−12 dB"); Spacer() } }
+                    .font(.caption2).foregroundStyle(.secondary).padding(4).allowsHitTesting(false)
             }
-            
-            // X-Axis (Frequency)
-            ForEach(xLines, id: \.self) { freq in
-                let x = EQMath.mapFreqToX(freq, width: width)
-                Path { p in
-                    p.move(to: CGPoint(x: x, y: 0))
-                    p.addLine(to: CGPoint(x: x, y: height))
-                }
-                .stroke(Color.primary.opacity(0.1), lineWidth: 1)
-                
-                Text(freq >= 1000 ? "\(Int(freq/1000))k" : "\(Int(freq))")
-                    .font(.system(size: 9)).foregroundColor(.secondary)
-                    .position(x: x + 12, y: height - 10)
-            }
+            .coordinateSpace(name: "eqGraph")
         }
+        .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func mapFrequency(_ frequency: Double, width: CGFloat) -> CGFloat {
+        CGFloat(min(1, max(0, log10(max(20, frequency) / 20) / 3))) * width
+    }
+
+    private func frequencyAt(_ x: CGFloat, width: CGFloat) -> Double {
+        20 * pow(1000, min(1, max(0, Double(x / max(1, width)))))
+    }
+
+    private func mapGain(_ gain: Double, height: CGFloat) -> CGFloat {
+        CGFloat((12 - min(12, max(-12, gain))) / 24) * height
     }
 }

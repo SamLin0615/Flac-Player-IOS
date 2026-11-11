@@ -103,6 +103,7 @@ final class FLACPlayer: ObservableObject {
     var effectivePreampDB: Double { eqEngine.effectivePreampDB }
     var autoPreamp: Bool { eqEngine.autoPreamp }
     var eqSampleRate: Double { eqEngine.sampleRate }
+    var eqBandTypes: [EQFilterType] { eqEngine.bandTypes }
     var upcomingSongs: [Song] {
         guard let index = currentIndex else { return [] }
         return Array(queue.dropFirst(index + 1))
