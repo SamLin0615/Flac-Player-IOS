@@ -13,27 +13,25 @@ struct QueueView: View {
                     }
                 }
                 Section("Up Next") {
-                    ForEach(player.upcomingSongs) { song in
+                    ForEach(Array(player.upcomingSongs.enumerated()), id: \.offset) { offset, song in
                         Button(action: {
-                            if let idx = player.queue.firstIndex(of: song) {
-                                player.playQueue(songs: player.queue, startIndex: idx)
-                            }
+                            player.jump(toQueueIndex: (player.currentIndex ?? -1) + 1 + offset)
                         }) {
                             SongRow(song: song)
                         }
                     }
-                    .onMove { source, destination in player.moveInQueue(from: source, to: destination) }
-                    .onDelete { offsets in player.removeFromQueue(at: offsets) }
+                    .onMove { source, destination in player.moveUpcoming(from: source, to: destination) }
+                    .onDelete { offsets in player.removeUpcoming(at: offsets) }
                 }
             }
             .listStyle(.plain)
             .navigationTitle("Queue")
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Shuffle") { player.shuffleUpcoming() }
+                    Button("Shuffle") { player.toggleShuffle() }
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Clear") { player.clearQueue(); dismiss() }
+                    Button("Clear") { player.clearUpNext(); dismiss() }
                 }
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button("Done") { dismiss() }

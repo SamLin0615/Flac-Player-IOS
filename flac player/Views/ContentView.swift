@@ -7,6 +7,7 @@ struct ContentView: View {
     @State private var showFileImporter = false
     @State private var showSearch = false
     @State private var playerOffsetY: CGFloat = ScreenBounds.current.height
+    @State private var restoredPlayback = false
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -45,7 +46,12 @@ struct ContentView: View {
             .allowsHitTesting(playerOffsetY < ScreenBounds.current.height * 0.5)
             .ignoresSafeArea()
         }
-        .onAppear { playerOffsetY = ScreenBounds.current.height }
+        .onAppear {
+            playerOffsetY = ScreenBounds.current.height
+            player.onTrackPlayed = { [weak library] song in library?.recordPlay(song) }
+            restorePlaybackIfNeeded()
+        }
+        .onChange(of: library.songs) { _, _ in restorePlaybackIfNeeded() }
         .sheet(isPresented: $showSearch) { SearchView(library: library, player: player) }
         .fileImporter(isPresented: $showFileImporter,
                       allowedContentTypes: [UTType(filenameExtension: "flac")!]) { result in
@@ -73,5 +79,11 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    private func restorePlaybackIfNeeded() {
+        guard !restoredPlayback, !library.songs.isEmpty else { return }
+        restoredPlayback = true
+        player.restoreSession(using: library)
     }
 }

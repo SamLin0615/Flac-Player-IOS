@@ -6,11 +6,16 @@ class RingBuffer {
     private var readIndex: Int = 0
     private var writeIndex: Int = 0
     private let lock = NSLock()
-    private(set) var availableToRead: Int = 0
+    private var readable: Int = 0
+    var availableToRead: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return readable
+    }
     var availableSpace: Int {
         lock.lock()
         defer { lock.unlock() }
-        return capacity - availableToRead
+        return capacity - readable
     }
 
     init(capacityInFrames: Int) {
@@ -22,7 +27,7 @@ class RingBuffer {
     func write(_ frames: UnsafePointer<Float>, count: Int) -> Int {
         lock.lock()
         defer { lock.unlock() }
-        let space = capacity - availableToRead
+        let space = capacity - readable
         let toWrite = min(space, count)
         if toWrite <= 0 { return 0 }
 
@@ -39,7 +44,7 @@ class RingBuffer {
         } else {
             writeIndex = (writeIndex + toWrite) % capacity
         }
-        availableToRead += toWrite
+        readable += toWrite
         return toWrite
     }
 
@@ -47,7 +52,7 @@ class RingBuffer {
     func read(_ frames: UnsafeMutablePointer<Float>, count: Int) -> Int {
         lock.lock()
         defer { lock.unlock() }
-        let toRead = min(availableToRead, count)
+        let toRead = min(readable, count)
         if toRead <= 0 { return 0 }
 
         let firstPart = min(capacity - readIndex, toRead)
@@ -63,7 +68,7 @@ class RingBuffer {
         } else {
             readIndex = (readIndex + toRead) % capacity
         }
-        availableToRead -= toRead
+        readable -= toRead
         return toRead
     }
 
@@ -71,7 +76,7 @@ class RingBuffer {
         lock.lock()
         readIndex = 0
         writeIndex = 0
-        availableToRead = 0
+        readable = 0
         lock.unlock()
     }
 }
