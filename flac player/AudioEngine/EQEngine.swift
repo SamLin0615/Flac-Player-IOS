@@ -1,187 +1,198 @@
 import Foundation
-import Accelerate
+import os
 
-enum EQFilterType {
-    case lowShelf, peaking, highShelf, lowPass, highPass
-}
+enum EQFilterType { case lowShelf, peaking, highShelf, lowPass, highPass }
 
 struct BiquadCoefficients {
-    var b0: Double = 0, b1: Double = 0, b2: Double = 0
+    var b0: Double = 1, b1: Double = 0, b2: Double = 0
     var a1: Double = 0, a2: Double = 0
 }
 
-class ParametricEQBand {
-    var type: EQFilterType
-    var frequency: Double
-    var gainDB: Double
-    var q: Double
-    
-    private var coeffs: BiquadCoefficients
-    private var targetCoeffs: BiquadCoefficients
-    private var x1: Double = 0, x2: Double = 0
-    private var y1: Double = 0, y2: Double = 0
-    private let smoothing: Double = 0.05 // Prevents zipper noise
+final class EQEngine {
+    static let defaultFrequencies: [Double] = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
+    private(set) var bandFreqs = EQEngine.defaultFrequencies
+    private(set) var bandGains = [Double](repeating: 0, count: 10)
+    private(set) var bandQs = [Double](repeating: 0.707, count: 10)
+    let bandTypes: [EQFilterType] = [.lowShelf, .peaking, .peaking, .peaking, .peaking, .peaking, .peaking, .peaking, .peaking, .highShelf]
+    private(set) var bypassed = false
+    private(set) var sampleRate: Double = 44100
+    private(set) var effectivePreampDB: Double = 0
+    var bandCount: Int { 10 }
+    var preampGainDB: Double = 0 { didSet { requireMain(); publish(); persist() } }
+    var autoPreamp = true { didSet { requireMain(); publish(); persist() } }
+    var selectedPresetID: UUID? { didSet { requireMain(); persist() } }
 
-    init(type: EQFilterType, frequency: Double, sampleRate: Double, gainDB: Double, q: Double) {
-        self.type = type
-        self.frequency = frequency
-        self.gainDB = gainDB
-        self.q = q
-        let c = Self.design(type: type, freq: frequency, fs: sampleRate, gainDB: gainDB, q: q)
-        self.coeffs = c
-        self.targetCoeffs = c
+    private let maxChannels = 2
+    private let lock: UnsafeMutablePointer<os_unfair_lock> = {
+        let pointer = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
+        pointer.initialize(to: os_unfair_lock())
+        return pointer
+    }()
+    private var target = [BiquadCoefficients](repeating: BiquadCoefficients(), count: 10)
+    private var targetGain: Float = 1
+    private var targetBypass = false
+    private var resetVersion = 0
+    // Only the render thread touches the following state.
+    private var renderCoefficients = [BiquadCoefficients](repeating: BiquadCoefficients(), count: 10)
+    private var renderGain: Float = 1
+    private var renderBypass = false
+    private var renderResetVersion = -1
+    private struct History {
+        var x1: Double = 0, x2: Double = 0, y1: Double = 0, y2: Double = 0
+    }
+    private var histories = [History](repeating: History(), count: 20)
+
+    private struct SavedState: Codable {
+        let frequencies: [Double]
+        let gains: [Double]
+        let qs: [Double]
+        let preamp: Double
+        let autoPreamp: Bool
+        let bypass: Bool
+        let presetID: UUID?
     }
 
-    func updateParameters(frequency: Double, sampleRate: Double, gainDB: Double, q: Double) {
-        self.frequency = frequency
-        self.gainDB = gainDB
-        self.q = q
-        targetCoeffs = Self.design(type: type, freq: frequency, fs: sampleRate, gainDB: gainDB, q: q)
-    }
-
-    func process(buffer: UnsafeMutablePointer<Float>, frames: Int) {
-        // Smooth coefficient transitions to prevent clicks
-        coeffs.b0 += (targetCoeffs.b0 - coeffs.b0) * smoothing
-        coeffs.b1 += (targetCoeffs.b1 - coeffs.b1) * smoothing
-        coeffs.b2 += (targetCoeffs.b2 - coeffs.b2) * smoothing
-        coeffs.a1 += (targetCoeffs.a1 - coeffs.a1) * smoothing
-        coeffs.a2 += (targetCoeffs.a2 - coeffs.a2) * smoothing
-
-        let b0 = Float(coeffs.b0), b1 = Float(coeffs.b1), b2 = Float(coeffs.b2)
-        let a1 = Float(coeffs.a1), a2 = Float(coeffs.a2)
-        var lx1 = Float(x1), lx2 = Float(x2)
-        var ly1 = Float(y1), ly2 = Float(y2)
-
-        for i in 0..<frames {
-            let x = buffer[i]
-            let y = b0 * x + b1 * lx1 + b2 * lx2 - a1 * ly1 - a2 * ly2
-            buffer[i] = y
-            lx2 = lx1; lx1 = x
-            ly2 = ly1; ly1 = y
+    init() {
+        precondition(Thread.isMainThread)
+        if let data = UserDefaults.standard.data(forKey: "EQState.v1"),
+           let saved = try? JSONDecoder().decode(SavedState.self, from: data),
+           Self.valid(frequencies: saved.frequencies, gains: saved.gains, qs: saved.qs), saved.preamp.isFinite {
+            bandFreqs = saved.frequencies; bandGains = saved.gains; bandQs = saved.qs
+            preampGainDB = saved.preamp; autoPreamp = saved.autoPreamp; bypassed = saved.bypass; selectedPresetID = saved.presetID
         }
-
-        x1 = Double(lx1); x2 = Double(lx2)
-        y1 = Double(ly1); y2 = Double(ly2)
+        publish()
     }
 
-    // Audio Cookbook Biquad Math
-    static func design(type: EQFilterType, freq: Double, fs: Double, gainDB: Double, q: Double) -> BiquadCoefficients {
-        let w0 = 2.0 * .pi * freq / fs
-        let alpha = sin(w0) / (2.0 * q)
-        let A = pow(10.0, gainDB / 40.0)
-        
-        var b0, b1, b2, a0, a1, a2: Double
-        
+    deinit { lock.deinitialize(count: 1); lock.deallocate() }
+
+    private func requireMain() { precondition(Thread.isMainThread, "EQ controls must run on main") }
+    private static func valid(frequencies: [Double], gains: [Double], qs: [Double]) -> Bool {
+        frequencies.count == 10 && gains.count == 10 && qs.count == 10 &&
+        frequencies.allSatisfy { $0.isFinite && $0 >= 20 && $0 <= 20000 } &&
+        gains.allSatisfy { $0.isFinite && abs($0) <= 24 } && qs.allSatisfy { $0.isFinite && $0 >= 0.1 && $0 <= 10 }
+    }
+    private func persist() {
+        let state = SavedState(frequencies: bandFreqs, gains: bandGains, qs: bandQs, preamp: preampGainDB,
+                               autoPreamp: autoPreamp, bypass: bypassed, presetID: selectedPresetID)
+        if let data = try? JSONEncoder().encode(state) { UserDefaults.standard.set(data, forKey: "EQState.v1") }
+    }
+    private func publish() {
+        let coefficients = (0..<bandCount).map {
+            Self.coefficients(type: bandTypes[$0], frequency: bandFreqs[$0], sampleRate: sampleRate, gainDB: bandGains[$0], q: bandQs[$0])
+        }
+        var boost = 0.0
+        if autoPreamp {
+            let upper = min(20000, sampleRate * 0.499)
+            for point in 0..<200 {
+                let frequency = exp(log(20) + Double(point) / 199 * (log(upper) - log(20)))
+                boost = max(boost, Self.magnitudeResponseDB(at: frequency, sampleRate: sampleRate, coefficients: coefficients))
+            }
+        }
+        effectivePreampDB = (preampGainDB.isFinite ? preampGainDB : 0) - boost
+        os_unfair_lock_lock(lock)
+        target = coefficients
+        targetGain = Float(pow(10, effectivePreampDB / 20))
+        targetBypass = bypassed
+        os_unfair_lock_unlock(lock)
+    }
+
+    func setSampleRate(_ rate: Double) {
+        requireMain(); guard rate.isFinite, rate > 40 else { return }
+        sampleRate = rate; publish(); reset()
+    }
+    func setBypass(_ bypass: Bool) { requireMain(); bypassed = bypass; publish(); persist() }
+    func reset() { requireMain(); os_unfair_lock_lock(lock); resetVersion += 1; os_unfair_lock_unlock(lock) }
+    func updateBand(index: Int, frequency: Double? = nil, gainDB: Double? = nil, q: Double? = nil) {
+        requireMain(); guard (0..<bandCount).contains(index) else { return }
+        if let frequency = frequency, frequency.isFinite { bandFreqs[index] = min(20000, max(20, frequency)) }
+        if let gain = gainDB, gain.isFinite { bandGains[index] = min(24, max(-24, gain)) }
+        if let q = q, q.isFinite { bandQs[index] = min(10, max(0.1, q)) }
+        selectedPresetID = nil
+        publish(); persist()
+    }
+    func loadPreset(preamp: Double, frequencies: [Double], gains: [Double], qs: [Double]) {
+        requireMain(); guard preamp.isFinite, Self.valid(frequencies: frequencies, gains: gains, qs: qs) else { return }
+        bandFreqs = frequencies; bandGains = gains; bandQs = qs
+        selectedPresetID = nil
+        preampGainDB = preamp
+        publish(); persist()
+    }
+
+    // Called once per render quantum, before any channels are processed.
+    func beginRender() {
+        guard os_unfair_lock_trylock(lock) else { return }
+        for index in 0..<10 { renderCoefficients[index] = target[index] }
+        renderGain = targetGain; renderBypass = targetBypass
+        if renderResetVersion != resetVersion {
+            for index in histories.indices { histories[index] = History() }
+            renderResetVersion = resetVersion
+        }
+        os_unfair_lock_unlock(lock)
+    }
+    func process(channel: Int, buffer: UnsafeMutablePointer<Float>, frames: Int) {
+        guard channel >= 0, channel < maxChannels, frames > 0, !renderBypass else { return }
+        for frame in 0..<frames { buffer[frame] *= renderGain }
+        for band in 0..<10 {
+            let coefficient = renderCoefficients[band]
+            if coefficient.b0 == 1 && coefficient.b1 == 0 && coefficient.b2 == 0 && coefficient.a1 == 0 && coefficient.a2 == 0 { continue }
+            let index = channel * 10 + band
+            var state = histories[index]
+            for frame in 0..<frames {
+                let input = Double(buffer[frame])
+                let output = coefficient.b0 * input + coefficient.b1 * state.x1 + coefficient.b2 * state.x2 - coefficient.a1 * state.y1 - coefficient.a2 * state.y2
+                buffer[frame] = Float(output)
+                state.x2 = state.x1; state.x1 = input; state.y2 = state.y1; state.y1 = output
+            }
+            histories[index] = state
+        }
+    }
+
+    static func magnitudeResponseDB(at frequency: Double, sampleRate: Double, coefficients: [BiquadCoefficients]) -> Double {
+        guard frequency.isFinite, sampleRate > 0 else { return 0 }
+        let omega = 2 * Double.pi * frequency / sampleRate
+        let c1 = cos(omega), s1 = sin(omega), c2 = cos(2 * omega), s2 = sin(2 * omega)
+        return coefficients.reduce(0) { result, c in
+            let nr = c.b0 + c.b1 * c1 + c.b2 * c2
+            let ni = -c.b1 * s1 - c.b2 * s2
+            let dr = 1 + c.a1 * c1 + c.a2 * c2
+            let di = -c.a1 * s1 - c.a2 * s2
+            return result + 10 * log10(max(1e-30, nr * nr + ni * ni) / max(1e-30, dr * dr + di * di))
+        }
+    }
+
+    static func coefficients(type: EQFilterType, frequency: Double, sampleRate: Double, gainDB: Double, q: Double) -> BiquadCoefficients {
+        guard sampleRate > 0, frequency.isFinite, gainDB.isFinite, q.isFinite else { return BiquadCoefficients() }
+        if gainDB == 0 && type != .lowPass && type != .highPass { return BiquadCoefficients() }
+        let frequency = min(max(1, frequency), sampleRate * 0.499)
+        let omega = 2 * Double.pi * frequency / sampleRate
+        let cosine = cos(omega), alpha = sin(omega) / (2 * max(0.1, q))
+        let a = pow(10, gainDB / 40), root = 2 * sqrt(a) * alpha
+        let b0, b1, b2, a0, a1, a2: Double
         switch type {
         case .peaking:
-            b0 = 1.0 + alpha * A
-            b1 = -2.0 * cos(w0)
-            b2 = 1.0 - alpha * A
-            a0 = 1.0 + alpha / A
-            a1 = -2.0 * cos(w0)
-            a2 = 1.0 - alpha / A
+            b0 = 1 + alpha * a; b1 = -2 * cosine; b2 = 1 - alpha * a
+            a0 = 1 + alpha / a; a1 = -2 * cosine; a2 = 1 - alpha / a
         case .lowShelf:
-            b0 = A * ((A + 1.0) - (A - 1.0) * cos(w0) + 2.0 * sqrt(A) * alpha)
-            b1 = 2.0 * A * ((A - 1.0) - (A + 1.0) * cos(w0))
-            b2 = A * ((A + 1.0) - (A - 1.0) * cos(w0) - 2.0 * sqrt(A) * alpha)
-            a0 = (A + 1.0) + (A - 1.0) * cos(w0) + 2.0 * sqrt(A) * alpha
-            a1 = -2.0 * ((A - 1.0) + (A + 1.0) * cos(w0))
-            a2 = (A + 1.0) + (A - 1.0) * cos(w0) - 2.0 * sqrt(A) * alpha
+            b0 = a * ((a + 1) - (a - 1) * cosine + root)
+            b1 = 2 * a * ((a - 1) - (a + 1) * cosine)
+            b2 = a * ((a + 1) - (a - 1) * cosine - root)
+            a0 = (a + 1) + (a - 1) * cosine + root
+            a1 = -2 * ((a - 1) + (a + 1) * cosine)
+            a2 = (a + 1) + (a - 1) * cosine - root
         case .highShelf:
-            b0 = A * ((A + 1.0) + (A - 1.0) * cos(w0) + 2.0 * sqrt(A) * alpha)
-            b1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * cos(w0))
-            b2 = A * ((A + 1.0) + (A - 1.0) * cos(w0) - 2.0 * sqrt(A) * alpha)
-            a0 = (A + 1.0) - (A - 1.0) * cos(w0) + 2.0 * sqrt(A) * alpha
-            a1 = 2.0 * ((A - 1.0) - (A + 1.0) * cos(w0))
-            a2 = (A + 1.0) - (A - 1.0) * cos(w0) - 2.0 * sqrt(A) * alpha
-        default: // Fallback to peaking
-            return design(type: .peaking, freq: freq, fs: fs, gainDB: gainDB, q: q)
+            b0 = a * ((a + 1) + (a - 1) * cosine + root)
+            b1 = -2 * a * ((a - 1) + (a + 1) * cosine)
+            b2 = a * ((a + 1) + (a - 1) * cosine - root)
+            a0 = (a + 1) - (a - 1) * cosine + root
+            a1 = 2 * ((a - 1) - (a + 1) * cosine)
+            a2 = (a + 1) - (a - 1) * cosine - root
+        case .lowPass:
+            b0 = (1 - cosine) / 2; b1 = 1 - cosine; b2 = b0
+            a0 = 1 + alpha; a1 = -2 * cosine; a2 = 1 - alpha
+        case .highPass:
+            b0 = (1 + cosine) / 2; b1 = -(1 + cosine); b2 = b0
+            a0 = 1 + alpha; a1 = -2 * cosine; a2 = 1 - alpha
         }
-        
-        return BiquadCoefficients(b0: b0/a0, b1: b1/a0, b2: b2/a0, a1: a1/a0, a2: a2/a0)
-    }
-}
-
-class EQEngine {
-    private(set) var bypassed = false
-    private var sampleRate: Double = 44100
-    private let maxChannels = 2
-    
-    // PREAMP STATE
-    public var preampGainDB: Double = 0.0
-    private var currentLinearGain: Float = 1.0
-
-    // PRESET STATE
-    var bandFreqs: [Double] = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
-    var bandGains: [Double] = Array(repeating: 0.0, count: 10)
-    var bandQs: [Double] = Array(repeating: 0.707, count: 10)
-    var bandTypes: [EQFilterType] = [.lowShelf, .peaking, .peaking, .peaking, .peaking, .peaking, .peaking, .peaking, .peaking, .highShelf]
-    
-    var bandCount: Int { return bandFreqs.count }
-    private var bandsPerChannel: [[ParametricEQBand]] = []
-
-    init() { allocateBands() }
-    
-    private func allocateBands() {
-        bandsPerChannel = (0..<maxChannels).map { _ in
-            (0..<bandFreqs.count).map { i in
-                ParametricEQBand(type: bandTypes[i], frequency: bandFreqs[i], sampleRate: sampleRate, gainDB: bandGains[i], q: bandQs[i])
-            }
-        }
-    }
-
-    func setSampleRate(_ sr: Double) {
-        guard sr != sampleRate else { return }
-        sampleRate = sr
-        allocateBands()
-    }
-    
-    func setBypass(_ bypass: Bool) { bypassed = bypass }
-
-    func updateBand(index: Int, frequency: Double? = nil, gainDB: Double? = nil, q: Double? = nil) {
-        guard index < bandFreqs.count else { return }
-        if let f = frequency { bandFreqs[index] = f }
-        if let g = gainDB { bandGains[index] = g }
-        if let qq = q { bandQs[index] = qq }
-
-        for ch in 0..<maxChannels {
-            bandsPerChannel[ch][index].updateParameters(
-                frequency: bandFreqs[index], sampleRate: sampleRate, gainDB: bandGains[index], q: bandQs[index]
-            )
-        }
-    }
-    
-    func loadPreset(preamp: Double, frequencies: [Double], gains: [Double], qs: [Double]) {
-        self.preampGainDB = preamp
-        for i in 0..<bandCount {
-            if i < frequencies.count {
-                updateBand(index: i, frequency: frequencies[i], gainDB: gains[i], q: qs[i])
-            }
-        }
-    }
-
-    // Argument label matching what line 450 in FLACPlayer.swift expects (frames:)
-    func process(channel: Int, buffer: UnsafeMutablePointer<Float>, frames: Int) {
-        guard !bypassed else { return }
-
-        // 1. GLOBAL PREAMP DSP (With Accelerate Ramping)
-        let targetGain = Float(pow(10.0, preampGainDB / 20.0))
-        let diff = targetGain - currentLinearGain
-        
-        if abs(diff) > 0.0001 {
-            var step: Float = diff / Float(frames)
-            var startGain = currentLinearGain
-            vDSP_vrampmul(buffer, 1, &startGain, &step, buffer, 1, vDSP_Length(frames))
-            currentLinearGain = targetGain
-        } else if targetGain != 1.0 {
-            var staticGain = targetGain
-            vDSP_vsmul(buffer, 1, &staticGain, buffer, 1, vDSP_Length(frames))
-        }
-
-        // 2. BIQUAD PROCESSING
-        let bands = bandsPerChannel[channel]
-        for band in bands {
-            band.process(buffer: buffer, frames: frames)
-        }
+        return BiquadCoefficients(b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0)
     }
 }
