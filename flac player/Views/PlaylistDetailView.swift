@@ -24,7 +24,7 @@ struct PlaylistDetailView: View {
                                 Image(systemName: "play.circle.fill").resizable().frame(width: 44, height: 44).foregroundColor(.accentColor)
                             }.buttonStyle(.plain)
                             
-                            Button(action: { player.playQueue(songs: songs.shuffled()) }) {
+                            Button(action: { player.play(songs: songs, shuffle: true) }) {
                                 Image(systemName: "shuffle.circle").resizable().frame(width: 44, height: 44).foregroundColor(.secondary)
                             }.buttonStyle(.plain)
                         }
@@ -38,14 +38,17 @@ struct PlaylistDetailView: View {
             .listRowBackground(Color.clear)
 
             // TRACKS
-            ForEach(songs) { song in
-                Button(action: { player.playQueue(songs: songs, startIndex: songs.firstIndex(of: song) ?? 0) }) {
+            ForEach(Array(songs.enumerated()), id: \.offset) { index, song in
+                Button(action: { player.playQueue(songs: songs, startIndex: index) }) {
                     SongRow(song: song)
                 }
                 .buttonStyle(.plain)
             }
             .onDelete { offsets in
-                for idx in offsets { library.removeSong(songs[idx], from: playlist) }
+                let current = library.playlists.first { $0.id == playlist.id } ?? playlist
+                let available = Set(library.songs.map { $0.id })
+                let visibleIndices = current.songIDs.indices.filter { available.contains(current.songIDs[$0]) }
+                library.removeSongs(at: IndexSet(offsets.compactMap { visibleIndices.indices.contains($0) ? visibleIndices[$0] : nil }), from: current)
             }
         }
         .listStyle(.plain)

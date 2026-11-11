@@ -1,13 +1,12 @@
 import SwiftUI
 
 struct AlbumDetailView: View {
-    let album: String
+    let album: Album
     @ObservedObject var library: MusicLibrary
     @ObservedObject var player: FLACPlayer
 
     private var songs: [Song] {
-        library.songs.filter { $0.album == album }
-            .sorted { ($0.discNumber ?? 0, $0.trackNumber ?? 0) < ($1.discNumber ?? 0, $1.trackNumber ?? 0) }
+        (library.albums.first { $0.id == album.id } ?? album).songs
     }
 
     var body: some View {
@@ -22,15 +21,15 @@ struct AlbumDetailView: View {
                     }
                     
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(album).font(.title2.bold()).lineLimit(3)
-                        Text(songs.first?.artist ?? "Unknown").font(.title3).foregroundColor(.secondary).lineLimit(2)
+                        Text(album.title).font(.title2.bold()).lineLimit(3)
+                        Text(album.artist).font(.title3).foregroundColor(.secondary).lineLimit(2)
                         
                         HStack(spacing: 20) {
                             Button(action: { player.playQueue(songs: songs) }) {
                                 Image(systemName: "play.circle.fill").resizable().frame(width: 44, height: 44).foregroundColor(.accentColor)
                             }.buttonStyle(.plain)
                             
-                            Button(action: { player.playQueue(songs: songs.shuffled()) }) {
+                            Button(action: { player.play(songs: songs, shuffle: true) }) {
                                 Image(systemName: "shuffle.circle").resizable().frame(width: 44, height: 44).foregroundColor(.secondary)
                             }.buttonStyle(.plain)
                         }

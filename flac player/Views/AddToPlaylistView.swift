@@ -11,7 +11,7 @@ struct AddToPlaylistView: View {
                 ForEach(library.playlists) { playlist in
                     Button(action: {
                         if let song = player.currentSong {
-                            library.addSong(song, to: playlist)
+                            library.addSongs([song], to: playlist)
                         }
                         dismiss()
                     }) {

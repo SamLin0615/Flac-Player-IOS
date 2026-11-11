@@ -5,9 +5,8 @@ struct ArtistDetailView: View {
     @ObservedObject var library: MusicLibrary
     @ObservedObject var player: FLACPlayer
 
-    private var songs: [Song] {
-        library.songs.filter { $0.artist == artist }.sorted { $0.title < $1.title }
-    }
+    private var albums: [Album] { library.albums.filter { $0.artist == artist } }
+    private var songs: [Song] { albums.flatMap { $0.songs } }
 
     var body: some View {
         List {
@@ -28,7 +27,7 @@ struct ArtistDetailView: View {
                                 Image(systemName: "play.circle.fill").resizable().frame(width: 44, height: 44).foregroundColor(.accentColor)
                             }.buttonStyle(.plain)
                             
-                            Button(action: { player.playQueue(songs: songs.shuffled()) }) {
+                            Button(action: { player.play(songs: songs, shuffle: true) }) {
                                 Image(systemName: "shuffle.circle").resizable().frame(width: 44, height: 44).foregroundColor(.secondary)
                             }.buttonStyle(.plain)
                         }
@@ -41,11 +40,15 @@ struct ArtistDetailView: View {
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
 
-            ForEach(songs) { song in
-                Button(action: { player.playQueue(songs: songs, startIndex: songs.firstIndex(of: song) ?? 0) }) {
-                    SongRow(song: song)
+            ForEach(albums) { album in
+                Section(album.title) {
+                    ForEach(album.songs) { song in
+                        Button(action: { player.playQueue(songs: songs, startIndex: songs.firstIndex(of: song) ?? 0) }) {
+                            SongRow(song: song)
+                        }
+                        .buttonStyle(.plain)
+                    }
                 }
-                .buttonStyle(.plain)
             }
         }
         .listStyle(.plain)

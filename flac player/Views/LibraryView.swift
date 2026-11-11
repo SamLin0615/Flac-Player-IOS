@@ -42,8 +42,8 @@ struct LibraryView: View {
                             }
                         }
                     case .albums:
-                        ForEach(library.albums, id: \.key) { album in
-                            NavigationLink(destination: AlbumDetailView(album: album.key, library: library, player: player)) {
+                        ForEach(library.albums) { album in
+                            NavigationLink(destination: AlbumDetailView(album: album, library: library, player: player)) {
                                 HStack {
                                     if let art = album.songs.first?.artwork {
                                         Image(uiImage: art)
@@ -62,10 +62,10 @@ struct LibraryView: View {
                                             .cornerRadius(6)
                                     }
                                     VStack(alignment: .leading) {
-                                        Text(album.key)
+                                        Text(album.title)
                                             .font(.system(.body, design: .rounded).weight(.semibold))
                                             .lineLimit(1)
-                                        Text(album.songs.first?.artist ?? "")
+                                        Text(album.artist)
                                             .font(.subheadline)
                                             .foregroundColor(.secondary)
                                             .lineLimit(1)
